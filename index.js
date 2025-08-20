@@ -1,84 +1,65 @@
 // index.js
-import { scrapeOnce } from "./scrape.js";
+import { scrapeAll } from "./scrape.js";
 import { google } from "googleapis";
 
-const {
-  SHEET_ID,
-  GOOGLE_CREDENTIALS,
-  SHEET_VND = "VND",
-  SHEET_CNY = "CNY",
-  SHEET_NPR = "NPR",
-  SHEET_KHR = "KHR",
-} = process.env;
+const SHEET_ID = process.env.SHEET_ID;
+const SHEET_VND = process.env.SHEET_VND || "VND";
+const SHEET_CNY = process.env.SHEET_CNY || "CNY";
+const SHEET_NPR = process.env.SHEET_NPR || "NPR";
+const SHEET_KHR = process.env.SHEET_KHR || "KHR";
 
-function authSheets() {
-  const creds = JSON.parse(GOOGLE_CREDENTIALS);
-  const jwt = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-  return google.sheets({ version: "v4", auth: jwt });
-}
-
-function groupByBase(rows) {
-  const map = new Map();
-  for (const r of rows) {
-    if (!map.has(r.base)) map.set(r.base, []);
-    map.get(r.base).push(r);
-  }
-  return map;
-}
-
-function makeRow(nowKST, itemsForBase) {
-  const kstDate = nowKST.toISOString().slice(0, 10);
-  const kstTime = nowKST.toTimeString().slice(0, 8);
-
-  const bySite = Object.fromEntries(itemsForBase.map(r => [r.site, r]));
-  const e9 = bySite.e9pay?.krwPerBase || 0;
-  const gm = bySite.gmoneytrans?.krwPerBase || 0;
-  const gme = bySite.gme?.krwPerBase || 0;
-  const mid = itemsForBase[0]?.mid || 0;
-
-  const candidates = [
-    ["e9pay", e9], ["gmoney", gm], ["gme", gme],
-  ].filter(([, v]) => v > 0);
-
-  const best = candidates.length ? candidates.sort((a, b) => b[1] - a[1])[0] : ["", 0];
-  const note = itemsForBase.map(r => r.note).filter(Boolean).join(" | ") || "0";
-
-  // EXACT column order to match your sheets:
-  return [kstDate, kstTime, e9, gm, gme, mid, best[0], best[1], note];
-}
-
-async function writeAll() {
-  const sheets = authSheets();
-  const data = await scrapeOnce();
-  const byBase = groupByBase(data);
-
-  const nowKST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
-
-  const baseToTab = new Map([
-    ["VND", SHEET_VND],
-    ["CNY", SHEET_CNY],
-    ["NPR", SHEET_NPR],
-    ["KHR", SHEET_KHR],
-  ]);
-
-  for (const [base, items] of byBase.entries()) {
-    const values = [makeRow(nowKST, items)];
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: `${baseToTab.get(base)}!A:I`,
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values },
-    });
-  }
-}
-
-writeAll().catch((e) => {
-  console.error("FATAL:", e);
-  process.exit(1);
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
+const sheets = google.sheets({ version: "v4", auth });
+
+function nowKST() {
+  const d = new Date();
+  const tz = "Asia/Seoul";
+  const date = new Intl.DateTimeFormat("en-CA", { timeZone: tz, dateStyle: "medium" })
+    .format(d)
+    .replace(/\./g, "-")
+    .replace(/\s/g, "")
+    .replace(/,$/, ""); // keep it clean
+  const time = new Intl.DateTimeFormat("en-GB", { timeZone: tz, timeStyle: "medium" }).format(d);
+  // standardize date to YYYY-MM-DD
+  const iso = new Date(d.toLocaleString("en-CA", { timeZone: tz })).toISOString().slice(0, 10);
+  return { date: iso, time };
+}
+
+async function appendRow(tab, row) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${tab}!A:Z`,
+    valueInputOption: "RAW",
+    requestBody: { values: [row] },
+  });
+}
+
+function toRow(date, time, r) {
+  return [
+    date,
+    time,
+    r.e9pay_krw_per_base ?? "",
+    r.gmoney_krw_per_base ?? "",
+    r.gme_krw_per_base ?? "",
+    "", // mid_krw_per_base (optional — leave blank or fill later)
+    r.best_site ?? "",
+    r.best_rate_krw_per_base ?? "",
+    r.notes ?? "",
+  ];
+}
+
+const TAB_BY_BASE = { VND: SHEET_VND, CNY: SHEET_CNY, NPR: SHEET_NPR, KHR: SHEET_KHR };
+
+(async () => {
+  const data = await scrapeAll();
+  const { date, time } = nowKST();
+
+  for (const r of data) {
+    const tab = TAB_BY_BASE[r.base] || r.base;
+    await appendRow(tab, toRow(date, time, r));
+  }
+  console.log("OK");
+})();
