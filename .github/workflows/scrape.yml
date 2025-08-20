@@ -2,7 +2,7 @@ name: Scrape FX Competitors
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/1 * * * *"   # every 1 minute (UTC) – TEMP TEST
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
 
 jobs:
   scrape:
@@ -10,20 +10,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
       - name: Install Playwright
         run: |
           npm ci || npm install
           npx playwright install --with-deps chromium
-
-      - name: Show trigger
-        run: echo "Event name: ${{ github.event_name }}"
-
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
