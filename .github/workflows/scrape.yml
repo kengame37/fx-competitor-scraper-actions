@@ -19,7 +19,7 @@ jobs:
           npm ci || npm install
           npx playwright install --with-deps chromium
       - name: Run scraper
-            - name: Upload debug artifacts (if any)
+      - name: Upload debug artifacts (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
