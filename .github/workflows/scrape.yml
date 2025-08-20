@@ -3,12 +3,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "*/1 * * * *"   # TEMP: every 1 minute (UTC)
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      TZ: Asia/Seoul          # <-- change to your timezone if you want
+      TZ: Asia/Seoul
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,6 +19,8 @@ jobs:
         run: |
           npm ci || npm install
           npx playwright install --with-deps chromium
+      - name: Show trigger
+        run: echo "Event: ${{ github.event_name }}"
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
