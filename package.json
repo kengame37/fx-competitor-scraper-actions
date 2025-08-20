@@ -2,11 +2,15 @@
   "name": "fx-competitor-scraper-actions",
   "version": "1.0.0",
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "googleapis": "^128.0.0",
-    "playwright": "^1.46.0"
+    "googleapis": "^131.0.0",
+    "playwright": "^1.45.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
