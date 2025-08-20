@@ -7,14 +7,8 @@ const SHEET_NAME = process.env.SHEET_NAME || "FX Competitor Log";
 const LOG_SHEET_TITLE = process.env.LOG_SHEET_TITLE || "log";
 const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS;
 
-if (!SHEET_ID) {
-  console.error("Missing SHEET_ID secret");
-  process.exit(1);
-}
-if (!GOOGLE_CREDENTIALS) {
-  console.error("Missing GOOGLE_CREDENTIALS secret");
-  process.exit(1);
-}
+if (!SHEET_ID) { console.error("Missing SHEET_ID secret"); process.exit(1); }
+if (!GOOGLE_CREDENTIALS) { console.error("Missing GOOGLE_CREDENTIALS secret"); process.exit(1); }
 
 const creds = JSON.parse(GOOGLE_CREDENTIALS);
 const scopes = [
@@ -26,8 +20,8 @@ const sheets = google.sheets({ version: "v4", auth: jwt });
 
 async function ensureSheetAndHeader() {
   const getRes = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  let sheetExists = getRes.data.sheets.some(s => s.properties.title === LOG_SHEET_TITLE);
-  if (!sheetExists) {
+  const exists = getRes.data.sheets.some(s => s.properties.title === LOG_SHEET_TITLE);
+  if (!exists) {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
       requestBody: { requests: [{ addSheet: { properties: { title: LOG_SHEET_TITLE } } }] }
@@ -59,9 +53,7 @@ async function appendRows(rows) {
     const batch = await scrapeAll();
     const ts = dayjs().format("YYYY-MM-DDTHH:mm:ssZ");
     const rows = batch.map(r => [
-      ts,
-      r.site,
-      r.pair,
+      ts, r.site, r.pair,
       r.implied_base_per_KRW ?? "",
       r.mid_raw_from_api ?? "",
       r.margin_abs_base_per_KRW ?? "",
