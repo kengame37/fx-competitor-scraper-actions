@@ -47,25 +47,24 @@ async function appendRows(rows) {
   });
 }
 
+// ... (top of file unchanged)
 (async () => {
   try {
     await ensureSheetAndHeader();
     const batch = await scrapeAll();
-    const ts = dayjs().format("YYYY-MM-DDTHH:mm:ssZ");
-const rows = batch.map(r => [
-  r.ts,                           // timestamp captured at scrape time
-  r.site,
-  r.pair,
-  r.implied_base_per_KRW ?? "",
-  r.mid_raw_from_api ?? "",
-  r.margin_abs_base_per_KRW ?? "",
-  r.margin_pct ?? "",
-  r.ok === true,
-  r.error || ""
-]);
-
+    const rows = batch.map(r => [
+      r.ts,                          // per-row, local timestamp from scrape.js
+      r.site,
+      r.pair,
+      r.implied_base_per_KRW ?? "",
+      r.mid_raw_from_api ?? "",
+      r.margin_abs_base_per_KRW ?? "",
+      r.margin_pct ?? "",
+      r.ok === true,
+      r.error || ""
+    ]);
     await appendRows(rows);
-    console.log(`Appended ${rows.length} rows at ${ts}`);
+    console.log(`Appended ${rows.length} rows`);
   } catch (e) {
     console.error("Run failed:", e?.message || e);
     process.exit(1);
