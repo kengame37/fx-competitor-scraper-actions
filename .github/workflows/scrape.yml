@@ -8,25 +8,23 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      TZ: Asia/Seoul         # timestamps in KST
+      TZ: Asia/Seoul
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-
       - name: Install Playwright
         run: |
           npm ci || npm install
           npx playwright install --with-deps chromium
-
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SHEET_NAME: ${{ secrets.SHEET_NAME }}
-          LOG_SHEET_TITLE: ${{ secrets.LOG_SHEET_TITLE }}
+          # Optional:
+          # TIMEZONE: ${{ secrets.TIMEZONE }}          # default Asia/Seoul
+          # SHEET_E9PAY: ${{ secrets.SHEET_E9PAY }}    # default "e9pay"
+          # SHEET_GMONEY: ${{ secrets.SHEET_GMONEY }}  # default "gmoney"
+          # SHEET_GME: ${{ secrets.SHEET_GME }}        # default "gme"
         run: npm start
