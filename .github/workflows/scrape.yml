@@ -1,24 +1,64 @@
 name: Scrape FX Competitors
+
 on:
-  workflow_dispatch:
+  # Runs automatically every 15 minutes (UTC)
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+    - cron: "*/15 * * * *"
+  # Allows you to trigger it manually from the Actions tab
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Prevent overlapping runs if a previous one is still going
+concurrency:
+  group: scrape-fx
+  cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
+      # For date/time columns in your sheet
       TZ: Asia/Seoul
+      TIMEZONE: Asia/Seoul
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install Playwright
+          cache: 'npm'
+
+      - name: Install dependencies
         run: |
-          npm ci || npm install
-          npx playwright install --with-deps chromium
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Show trigger
+        run: echo "Event: ${{ github.event_name }}  @ ${{ github.run_started_at }}"
+
       - name: Run scraper
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          # Optional: override tab names (otherwise index.js defaults are used)
+          SHEET_VND: ${{ secrets.SHEET_VND }}
+          SHEET_CNY: ${{ secrets.SHEET_CNY }}
+          SHEET_NPR: ${{ secrets.SHEET_NPR }}
+          SHEET_KHR: ${{ secrets.SHEET_KHR }}
+        run: npm start
+
+      # Collect screenshots/HTML when a site fails so you can inspect it
       - name: Upload debug artifacts (if any)
         if: always()
         uses: actions/upload-artifact@v4
@@ -26,12 +66,3 @@ jobs:
           name: debug
           path: debug/
           if-no-files-found: ignore
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          # Optional:
-          # TIMEZONE: ${{ secrets.TIMEZONE }}          # default Asia/Seoul
-          # SHEET_E9PAY: ${{ secrets.SHEET_E9PAY }}    # default "e9pay"
-          # SHEET_GMONEY: ${{ secrets.SHEET_GMONEY }}  # default "gmoney"
-          # SHEET_GME: ${{ secrets.SHEET_GME }}        # default "gme"
-        run: npm start
