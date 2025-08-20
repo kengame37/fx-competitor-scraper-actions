@@ -4,6 +4,18 @@ const PAIRS = [["USD","KRW"],["CNY","KRW"],["NPR","KRW"],["KHR","KRW"]];
 const SITES = ["gmoneytrans","e9pay","gme"];
 const SEND_KRW_AMOUNT = 1_000_000;
 
+// ---- add per-row timestamp (uses the runner's TZ) ----
+function nowLocalISO() {
+  const d = new Date(); // respects TZ from workflow env
+  const pad = n => String(n).padStart(2, "0");
+  const y = d.getFullYear(), m = pad(d.getMonth()+1), day = pad(d.getDate());
+  const hh = pad(d.getHours()), mm = pad(d.getMinutes()), ss = pad(d.getSeconds());
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  const oh = pad(Math.floor(Math.abs(off)/60)), om = pad(Math.abs(off)%60);
+  return `${y}-${m}-${day}T${hh}:${mm}:${ss}${sign}${oh}:${om}`;
+}
+
 async function fetchJSON(url) {
   const r = await fetch(url, { cache: "no-store", headers: { "Accept": "application/json" } });
   const t = await r.text();
@@ -108,13 +120,31 @@ export async function scrapeAll() {
           err = "no implied rate found";
         }
 
-        rows.push({ site, pair: `${base}/${quote}`, implied_base_per_KRW: implied,
-          mid_raw_from_api: mid, margin_abs_base_per_KRW: margin_abs, margin_pct, ok, error: err });
+        // ---- include per-row timestamp here ----
+        rows.push({
+          ts: nowLocalISO(),
+          site,
+          pair: `${base}/${quote}`,
+          implied_base_per_KRW: implied,
+          mid_raw_from_api: mid,
+          margin_abs_base_per_KRW: margin_abs,
+          margin_pct,
+          ok,
+          error: err
+        });
 
       } catch (e) {
-        rows.push({ site, pair: `${base}/${quote}`, implied_base_per_KRW: null,
-          mid_raw_from_api: null, margin_abs_base_per_KRW: null, margin_pct: null,
-          ok: false, error: (e?.message || String(e)).slice(0,200) });
+        rows.push({
+          ts: nowLocalISO(),
+          site,
+          pair: `${base}/${quote}`,
+          implied_base_per_KRW: null,
+          mid_raw_from_api: null,
+          margin_abs_base_per_KRW: null,
+          margin_pct: null,
+          ok: false,
+          error: (e?.message || String(e)).slice(0,200)
+        });
       }
     }
   }
