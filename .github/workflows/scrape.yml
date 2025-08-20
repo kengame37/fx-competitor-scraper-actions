@@ -2,7 +2,7 @@ name: Scrape FX Competitors
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+    - cron: "*/1 * * * *"   # TEMP: every 1 minute (UTC)
 
 jobs:
   scrape:
