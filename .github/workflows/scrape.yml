@@ -1,16 +1,16 @@
 name: Scrape FX Competitors
 
 on:
-  # Runs automatically every 15 minutes (UTC)
+  # Every 15 minutes (UTC)
   schedule:
-    - cron: "*/15 * * * *"
-  # Allows you to trigger it manually from the Actions tab
+    - cron: '*/15 * * * *'
+  # Allow manual runs
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
-# Prevent overlapping runs if a previous one is still going
+# Avoid overlapping runs
 concurrency:
   group: scrape-fx
   cancel-in-progress: false
@@ -19,9 +19,7 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # For date/time columns in your sheet
       TZ: Asia/Seoul
-      TIMEZONE: Asia/Seoul
 
     steps:
       - name: Checkout
@@ -42,23 +40,26 @@ jobs:
           fi
 
       - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install --with-deps chromium
 
-      - name: Show trigger
-        run: echo "Event: ${{ github.event_name }}  @ ${{ github.run_started_at }}"
+      - name: Show trigger (debug)
+        run: |
+          echo "Event=${{ github.event_name }}"
+          echo "Run ID=${{ github.run_id }}"
+          date -u
 
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          # Optional: override tab names (otherwise index.js defaults are used)
+          # Optional custom tab names; safe to leave blank
           SHEET_VND: ${{ secrets.SHEET_VND }}
           SHEET_CNY: ${{ secrets.SHEET_CNY }}
           SHEET_NPR: ${{ secrets.SHEET_NPR }}
           SHEET_KHR: ${{ secrets.SHEET_KHR }}
         run: npm start
 
-      # Collect screenshots/HTML when a site fails so you can inspect it
       - name: Upload debug artifacts (if any)
         if: always()
         uses: actions/upload-artifact@v4
