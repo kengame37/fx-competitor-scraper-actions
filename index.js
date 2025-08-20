@@ -1,24 +1,35 @@
-// index.js — writes exactly the columns you want into Google Sheets
-
+// index.js — append 5 columns to 3 separate tabs: e9pay, gmoney, gme
 import { google } from "googleapis";
 import { scrapeAll } from "./scrape.js";
 
-const SHEET_ID = process.env.SHEET_ID;                           // e.g. 19H0TIMF...
-const SHEET_NAME = process.env.SHEET_NAME || "log";              // tab name to write into
+// ---- ENV ----
+const SPREADSHEET_ID = process.env.SHEET_ID;                  // your sheet id
 const GOOGLE_CREDENTIALS = JSON.parse(process.env.GOOGLE_CREDENTIALS || "{}");
+const TIMEZONE = process.env.TIMEZONE || "Asia/Seoul";        // separate date/time in this TZ
 
-const HEADER = [
-  "timestamp",
-  "site",
-  "base",
-  "quote",
-  "service_krw_per_base",
-  "mid_krw_per_base",
-  "spread_krw_per_base",
-  "spread_pct",
-  "ok",
-  "error",
-];
+// Tab names (override via secrets if you want different names)
+const SHEET_TABS = {
+  e9pay: process.env.SHEET_E9PAY || "e9pay",
+  gmoneytrans: process.env.SHEET_GMONEY || "gmoney",
+  gme: process.env.SHEET_GME || "gme",
+};
+
+// Header for each tab
+const HEADER = ["date", "time", "site", "base", "quote"];
+
+// ---- Helpers ----
+function formatDate(d, tz) {
+  // YYYY-MM-DD
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d);
+}
+function formatTime(d, tz) {
+  // HH:mm:ss (24h)
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).format(d);
+}
 
 async function getSheets() {
   const auth = new google.auth.JWT(
@@ -31,82 +42,88 @@ async function getSheets() {
   return google.sheets({ version: "v4", auth });
 }
 
-async function ensureHeaderIfBlank(sheets) {
+async function listSheetTitles(sheets) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  return new Set((meta.data.sheets || []).map(s => s.properties?.title));
+}
+
+async function ensureSheetAndHeader(sheets, title) {
+  const titles = await listSheetTitles(sheets);
+  if (!titles.has(title)) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title } } }] },
+    });
+  }
+  // ensure header A1:E1
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A1:J1`,
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${title}!A1:E1`,
   }).catch(() => null);
 
-  const hasHeader =
-    res && res.data && Array.isArray(res.data.values) && res.data.values.length > 0;
-
+  const hasHeader = res?.data?.values?.length > 0;
   if (!hasHeader) {
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `${SHEET_NAME}!A1`,
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${title}!A1`,
       valueInputOption: "RAW",
       requestBody: { values: [HEADER] },
     });
   }
 }
 
-async function appendRows(sheets, rows) {
+async function appendRows(sheets, title, rows) {
   if (!rows.length) return;
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:A`,
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${title}!A:A`,
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values: rows },
   });
 }
 
-function toNumber(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function toFixedOrBlank(n) {
-  return n == null ? "" : n;   // leave formatting to Sheets
-}
-
 (async () => {
   try {
     const sheets = await getSheets();
-    await ensureHeaderIfBlank(sheets);
 
-    // Run the scraper once (it returns one record per site × pair)
+    // Ensure the three tabs exist (with headers)
+    const titles = [
+      SHEET_TABS.e9pay,
+      SHEET_TABS.gmoneytrans,
+      SHEET_TABS.gme,
+    ];
+    for (const t of titles) {
+      await ensureSheetAndHeader(sheets, t);
+    }
+
+    // Scrape once (returns one record per site × pair)
     const batch = await scrapeAll();
 
-    // Convert to your desired 10-column row shape
-    const rows = batch.map((r) => {
+    // Build rows per tab with just the 5 requested columns
+    const perTab = { [SHEET_TABS.e9pay]: [], [SHEET_TABS.gmoneytrans]: [], [SHEET_TABS.gme]: [] };
+
+    for (const r of batch) {
       const [base, quote] = (r.pair || "").split("/");
-      // implied_base_per_KRW is BASE per KRW  -> convert to KRW per BASE
-      const service = r.implied_base_per_KRW != null ? 1 / r.implied_base_per_KRW : null;
-      const mid = toNumber(r.mid_raw_from_api);
-
-      let spread = null, spreadPct = null;
-      if (service != null && mid != null) {
-        spread = service - mid;
-        spreadPct = mid !== 0 ? spread / mid : null;
-      }
-
-      return [
-        r.ts || "",               // timestamp
-        r.site || "",             // site
-        base || "",               // base
-        quote || "",              // quote
-        toFixedOrBlank(service),  // service_krw_per_base
-        toFixedOrBlank(mid),      // mid_krw_per_base
-        toFixedOrBlank(spread),   // spread_krw_per_base
-        toFixedOrBlank(spreadPct),// spread_pct
-        r.ok === true,            // ok (TRUE/FALSE)
-        r.error || ""             // error
+      const d = new Date(r.ts || Date.now());
+      const row = [
+        formatDate(d, TIMEZONE),     // date
+        formatTime(d, TIMEZONE),     // time
+        r.site || "",                // site
+        base || "",                  // base
+        quote || "",                 // quote
       ];
-    });
+      const tab = SHEET_TABS[r.site] || SHEET_TABS.gmoneytrans; // fallback
+      if (!perTab[tab]) perTab[tab] = [];
+      perTab[tab].push(row);
+    }
 
-    await appendRows(sheets, rows);
-    console.log(`Wrote ${rows.length} rows to ${SHEET_NAME}`);
+    // Append to each tab
+    for (const [tab, rows] of Object.entries(perTab)) {
+      if (rows?.length) await appendRows(sheets, tab, rows);
+    }
+
+    console.log("Appended rows:", Object.fromEntries(Object.entries(perTab).map(([t, rows]) => [t, rows.length])));
   } catch (e) {
     console.error("Run failed:", e?.message || e);
     process.exit(1);
