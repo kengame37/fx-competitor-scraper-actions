@@ -32,7 +32,7 @@ jobs:
           echo "Run number: $GITHUB_RUN_NUMBER"
           date -u
 
-           - name: Run scraper
+      - name: Run scraper
         env:
           # Ensure unhandled rejections fail the job
           NODE_OPTIONS: --unhandled-rejections=strict
