@@ -1,9 +1,9 @@
 name: Scrape FX Competitors
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -19,13 +19,20 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Playwright + Chromium
+      - name: Install Playwright Chromium
         run: |
-          npm install
+          npm ci || npm install
           npx playwright install --with-deps chromium
+
+      - name: Show trigger
+        run: echo "Event: ${{ github.event_name }} | started_at=${{ github.run_started_at }}"
 
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_VND: ${{ secrets.SHEET_VND }}
+          SHEET_CNY: ${{ secrets.SHEET_CNY }}
+          SHEET_NPR: ${{ secrets.SHEET_NPR }}
+          SHEET_KHR: ${{ secrets.SHEET_KHR }}
         run: npm start
