@@ -32,12 +32,24 @@ jobs:
           echo "Run number: $GITHUB_RUN_NUMBER"
           date -u
 
-      - name: Run scraper
+           - name: Run scraper
         env:
+          # Ensure unhandled rejections fail the job
+          NODE_OPTIONS: --unhandled-rejections=strict
+
+          # From GitHub Secrets
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+          # Tab names (choose ONE approach)
+          # A) from secrets:
           SHEET_VND: ${{ secrets.SHEET_VND }}
           SHEET_CNY: ${{ secrets.SHEET_CNY }}
           SHEET_NPR: ${{ secrets.SHEET_NPR }}
           SHEET_KHR: ${{ secrets.SHEET_KHR }}
+          # B) or hard-code (uncomment these and remove A):
+          # SHEET_VND: VND
+          # SHEET_CNY: CNY
+          # SHEET_NPR: NPR
+          # SHEET_KHR: KHR
         run: npm start
