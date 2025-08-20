@@ -1,0 +1,11 @@
+{
+  "name": "fx-competitor-scraper-actions",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "playwright": "^1.45.0",
+    "googleapis": "^131.0.0",
+    "dayjs": "^1.11.10"
+  }
+}
