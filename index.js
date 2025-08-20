@@ -7,7 +7,7 @@ const SPREADSHEET_ID = process.env.SHEET_ID; // Google Sheet ID
 const GOOGLE_CREDENTIALS = JSON.parse(process.env.GOOGLE_CREDENTIALS || "{}");
 const TIMEZONE = process.env.TIMEZONE || "Asia/Seoul"; // for date/time split
 
-// Tabs are the BASE currencies (you can rename via secrets if you want)
+// Tabs are the BASE currencies
 const TAB_BY_BASE = {
   VND: process.env.SHEET_VND || "VND",
   CNY: process.env.SHEET_CNY || "CNY",
@@ -33,7 +33,13 @@ function formatDate(d, tz) {
 function formatTime(d, tz) {
   return new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(d);
 }
-function n(x) { const v = Number(x); return Number.isFinite(v) ? v : null; }
+
+function safeRateKRWPerBaseFromImplied(impliedBasePerKRW) {
+  // implied = BASE per 1 KRW; we want KRW per 1 BASE
+  if (impliedBasePerKRW == null) return null;
+  const r = 1 / impliedBasePerKRW;
+  return Number.isFinite(r) && r > 0 ? r : null;
+}
 
 async function getSheets() {
   const auth = new google.auth.JWT(
@@ -95,76 +101,78 @@ async function appendRow(sheets, title, row) {
 
     // Scrape results (site × pair)
     const results = await scrapeAll();
+
     const now = new Date(results?.[0]?.ts || Date.now());
     const dateStr = formatDate(now, TIMEZONE);
     const timeStr = formatTime(now, TIMEZONE);
 
-    // Build per-currency aggregates for this run
-    // { VND: { e9pay: number|null, gmoneytrans: number|null, gme: number|null, mid: number|null, notes: [] }, ... }
+    // Prepare per-currency records
     const bases = ["VND", "CNY", "NPR", "KHR"];
-    const byBase = Object.fromEntries(bases.map(b => [b, { e9pay: null, gmoneytrans: null, gme: null, mid: null, notes: [] }]));
+    const perBase = Object.fromEntries(
+      bases.map(b => [b, { e9pay: null, gmoneytrans: null, gme: null, mid: null, notes: [] }])
+    );
 
+    // Fill from raw rows
     for (const r of results) {
       const [base, quote] = (r.pair || "").split("/");
       if (!bases.includes(base) || quote !== "KRW") continue;
 
-      // Convert implied (BASE per KRW) -> KRW per BASE
-      const rate = r.implied_base_per_KRW ? (1 / r.implied_base_per_KRW) : null;
-      if (rate != null) {
-        if (r.site === "e9pay") byBase[base].e9pay = rate;
-        else if (r.site === "gmoneytrans") byBase[base].gmoneytrans = rate;
-        else if (r.site === "gme") byBase[base].gme = rate;
-      } else if (r.error) {
-        byBase[base].notes.push(`${r.site}: ${r.error}`);
+      // mid is KRW per BASE from API (same across sites). Keep first seen.
+      if (perBase[base].mid == null && r.mid_raw_from_api != null) {
+        perBase[base].mid = r.mid_raw_from_api;
       }
 
-      // mid from API (they're the same across sites; take first non-null)
-      const mid = n(r.mid_raw_from_api);
-      if (byBase[base].mid == null && mid != null) byBase[base].mid = mid;
+      // Only keep service rate if sanity check passed (ok === true)
+      if (r.ok === true) {
+        const rateKRWPerBase = safeRateKRWPerBaseFromImplied(r.implied_base_per_KRW);
+        if (rateKRWPerBase != null) {
+          if (r.site === "e9pay") perBase[base].e9pay = rateKRWPerBase;
+          else if (r.site === "gmoneytrans") perBase[base].gmoneytrans = rateKRWPerBase;
+          else if (r.site === "gme") perBase[base].gme = rateKRWPerBase;
+        } else if (r.error) {
+          perBase[base].notes.push(`${r.site}: ${r.error}`);
+        }
+      } else if (r.error) {
+        perBase[base].notes.push(`${r.site}: ${r.error}`);
+      }
     }
 
-    // Emit one row per currency tab
+    // One row per currency tab
     for (const base of bases) {
       const tab = TAB_BY_BASE[base];
-      const entry = byBase[base];
+      const entry = perBase[base];
 
-      const e9 = n(entry.e9pay);
-      const gm = n(entry.gmoneytrans);
-      const ge = n(entry.gme);
-
-      // choose best (highest KRW per BASE)
-      const candidates = [
-        ["e9pay", e9],
-        ["gmoney", gm],
-        ["gme", ge],
-      ].filter(([_name, v]) => v != null);
+      // choose best among non-null
+      const cands = [
+        ["e9pay", entry.e9pay],
+        ["gmoney", entry.gmoneytrans],
+        ["gme", entry.gme],
+      ].filter(([_n, v]) => Number.isFinite(v));
 
       let bestSite = "";
       let bestRate = "";
-      if (candidates.length) {
-        const [bName, bVal] = candidates.reduce((a, b) => (a[1] > b[1] ? a : b));
-        bestSite = bName;
-        bestRate = bVal;
+      if (cands.length) {
+        const [n, v] = cands.reduce((a, b) => (a[1] > b[1] ? a : b));
+        bestSite = n;
+        bestRate = v;
       }
-
-      const notes = entry.notes.join(" | ");
 
       const row = [
         dateStr,
         timeStr,
-        e9 ?? "",
-        gm ?? "",
-        ge ?? "",
+        entry.e9pay ?? "",        // blanks if missing, not 0
+        entry.gmoneytrans ?? "",
+        entry.gme ?? "",
         entry.mid ?? "",
         bestSite,
         bestRate,
-        notes
+        entry.notes.join(" | "),
       ];
 
       await appendRow(sheets, tab, row);
     }
 
-    console.log("Appended rows to tabs:", Object.values(TAB_BY_BASE).join(", "));
+    console.log("OK: appended rows to currency tabs.");
   } catch (e) {
     console.error("Run failed:", e?.message || e);
     process.exit(1);
