@@ -1,23 +1,15 @@
 name: Scrape FX Competitors
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes UTC
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-
-concurrency:
-  group: scrape-fx
-  cancel-in-progress: false
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Seoul
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,38 +19,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install Playwright + Chromium
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      - name: Install Playwright Chromium
-        run: |
+          npm install
           npx playwright install --with-deps chromium
-
-      - name: Show trigger (debug)
-        run: |
-          echo "Event=${{ github.event_name }}"
-          echo "Run ID=${{ github.run_id }}"
-          date -u
 
       - name: Run scraper
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SHEET_VND: ${{ secrets.SHEET_VND }}
-          SHEET_CNY: ${{ secrets.SHEET_CNY }}
-          SHEET_NPR: ${{ secrets.SHEET_NPR }}
-          SHEET_KHR: ${{ secrets.SHEET_KHR }}
         run: npm start
-
-      - name: Upload debug artifacts (if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: debug/
-          if-no-files-found: ignore
