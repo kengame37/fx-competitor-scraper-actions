@@ -1,125 +1,167 @@
-// index.js
-import { google } from "googleapis";
-import { scrapeAll } from "./scrape.js";
+// scrape.js
+// Scrapes e9pay / gmoneytrans / gme and returns rows suitable for Google Sheets.
+// Each row contains: timestamp, site, base, quote=KRW, service_krw_per_base, mid_krw_per_base, spread_krw_per_base, spread_pct, ok, error
 
-const SHEET_ID = process.env.SHEET_ID;
-const CREDS = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-
-// Tabs (must exist in the spreadsheet)
-const TABS = ["VND", "CNY", "NPR", "KHR"];
-
-// Column header
-const HEADER = [
-  "date",
-  "time",
-  "e9pay_krw_per_base",
-  "gmoney_krw_per_base",
-  "gme_krw_per_base",
-  "mid_krw_per_base",
-  "best_site",
-  "best_rate_krw_per_base",
-  "notes",
-];
-
-async function getSheetsClient() {
-  const auth = new google.auth.JWT(
-    CREDS.client_email,
-    null,
-    CREDS.private_key.replace(/\\n/g, "\n"),
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-  return google.sheets({ version: "v4", auth });
+// ---------- helpers ----------
+async function getMidKrwPerBase(base) {
+  // KRW per BASE (e.g., base=CNY -> ~193.5)
+  const u = `https://api.exchangerate.host/latest?base=${encodeURIComponent(base)}&symbols=KRW`;
+  const r = await fetch(u, { headers: { Accept: "application/json" }, cache: "no-store" });
+  const j = await r.json();
+  if (!j?.rates?.KRW) throw new Error("mid not found");
+  return j.rates.KRW;
 }
 
-async function ensureHeader(sheets, tab) {
-  const range = `${tab}!A1:I1`;
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range,
-  }).catch(() => null);
+// very tolerant parser; understands:
+//  - "1 CNY = 194.96 KRW"   -> 194.96
+//  - "1 KRW = 0.005119 CNY" -> invert -> 195.37
+function extractKrwPerBaseFromText(txt, base) {
+  if (!txt) return NaN;
+  const t = txt.replace(/\u00a0/g, " ").replace(/,/g, " ").replace(/\s+/g, " ").trim();
 
-  const have = res?.data?.values?.[0] || [];
-  const same = have.length === HEADER.length && have.every((v, i) => v === HEADER[i]);
-  if (!same) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range,
-      valueInputOption: "RAW",
-      requestBody: { values: [HEADER] },
-    });
-  }
+  // "1 BASE = N KRW"
+  let m = t.match(new RegExp(`1\\s*${base}\\s*=\\s*([0-9.]+)\\s*KRW`, "i"));
+  if (m) return parseFloat(m[1]);
+
+  // "1 KRW = N BASE" -> invert
+  m = t.match(new RegExp(`1\\s*KRW\\s*=\\s*([0-9.]+)\\s*${base}`, "i"));
+  if (m) return 1 / parseFloat(m[1]);
+
+  // fallback first number (only used if sanity passes)
+  m = t.match(/([0-9]+(?:\.[0-9]+)?)/);
+  return m ? parseFloat(m[1]) : NaN;
 }
 
-function pickBestSite(row) {
-  const candidates = [
-    { site: "e9pay", rate: row.e9pay || 0 },
-    { site: "gmoney", rate: row.gmoney || 0 },
-    { site: "gme", rate: row.gme || 0 },
-  ].filter(x => x.rate > 0);
-
-  if (!candidates.length) return { bestSite: "", bestRate: 0 };
-  const best = candidates.reduce((a, b) => (b.rate > a.rate ? b : a));
-  return { bestSite: best.site, bestRate: best.rate };
+// sanity vs mid
+function gateAgainstMid(val, mid) {
+  if (!Number.isFinite(val) || val <= 0) return { ok: false, val: NaN, why: "not finite" };
+  if (!Number.isFinite(mid) || mid <= 0) return { ok: true, val };
+  const lo = mid * 0.6, hi = mid * 1.4;
+  if (val < lo || val > hi) return { ok: false, val: NaN, why: `sanity: ${val} vs mid ${mid}` };
+  return { ok: true, val };
 }
 
-function groupRowsByBase(rows) {
-  const out = {};
-  for (const r of rows) {
-    const base = r.base;
-    if (!out[base]) {
-      out[base] = {
-        date: r.date, time: r.time, mid: r.mid_krw_per_base ?? null,
-        e9pay: 0, gmoney: 0, gme: 0, notes: []
-      };
+// best-effort amount fill (1,000,000 KRW)
+async function setSendAmountKRW(page) {
+  try {
+    const inputs = page.locator("input[type=number], input[inputmode=numeric], input[mode=numeric]");
+    if (await inputs.count()) {
+      await inputs.first().fill("1000000");
+      await page.waitForTimeout(500);
     }
-    if (r.ok && r.service_krw_per_base) {
-      if (r.site === "e9pay") out[base].e9pay = r.service_krw_per_base;
-      if (r.site === "gmoneytrans") out[base].gmoney = r.service_krw_per_base;
-      if (r.site === "gme") out[base].gme = r.service_krw_per_base;
-    } else if (r.error) {
-      out[base].notes.push(`${r.site}: ${r.error}`);
+  } catch {}
+}
+
+// ---------- site scrapers ----------
+
+// e9pay: #display-exrate contains "1 BASE = N KRW"
+async function scrape_e9pay(page, base) {
+  await page.goto("https://www.e9pay.co.kr/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  await setSendAmountKRW(page);
+  // try to switch language to English if visible (optional)
+  try { await page.getByText("English", { exact: false }).first().click({ timeout: 1500 }); } catch {}
+  await page.waitForSelector("#display-exrate", { timeout: 12000 });
+  const raw = await page.locator("#display-exrate").innerText().catch(() => "");
+  const parsed = extractKrwPerBaseFromText(raw, base);
+  return { value: parsed, raw };
+}
+
+// gmoneytrans: #rate has "1 KRW = 0.005119 CNY" (invert)
+async function scrape_gmoneytrans(page, base) {
+  await page.goto("https://gmoneytrans.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  await setSendAmountKRW(page);
+  await page.waitForSelector("#rate", { timeout: 12000 });
+  const raw = await page.locator("#rate").innerText().catch(() => "");
+  const parsed = extractKrwPerBaseFromText(raw, base);
+  return { value: parsed, raw };
+}
+
+// GME: #currentRate shows TARGET per KRW; we invert.
+// We try to choose the country to match the BASE where possible.
+const GME_COUNTRY_BY_BASE = {
+  VND: "Vietnam",
+  CNY: "China",
+  NPR: "Nepal",
+  KHR: "Cambodia"
+};
+
+async function trySelectGmeCountry(page, base) {
+  const country = GME_COUNTRY_BY_BASE[base];
+  if (!country) return;
+  // The UI is a custom dropdown; try clicking the label then the country by text.
+  try {
+    // Click near "Select Your Country" area
+    await page.getByText("Select Your Country", { exact: false }).first().click({ timeout: 2000 });
+  } catch {}
+  try {
+    await page.getByText(country, { exact: false }).first().click({ timeout: 2000 });
+    await page.waitForTimeout(700);
+  } catch {}
+}
+
+async function scrape_gme(page, base) {
+  await page.goto("https://www.gmeremit.com/personal/", { waitUntil: "domcontentloaded", timeout: 60000 });
+  await setSendAmountKRW(page);
+  await trySelectGmeCountry(page, base);
+  await page.waitForSelector("#currentRate", { timeout: 12000 });
+  const raw = (await page.locator("#currentRate").innerText().catch(() => "")).replace(/,/g, "");
+  const targetPerKRW = parseFloat(raw); // e.g., CNY per KRW
+  const parsed = Number.isFinite(targetPerKRW) && targetPerKRW > 0 ? (1 / targetPerKRW) : NaN; // KRW per TARGET
+  return { value: parsed, raw: `currentRate=${raw}` };
+}
+
+// ---------- main entry ----------
+
+export async function scrapeAll() {
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ locale: "en-US" });
+
+  const BASES = ["VND", "CNY", "NPR", "KHR"]; // quote is always KRW
+  const SITES = ["e9pay", "gmoneytrans", "gme"];
+
+  const rows = [];
+
+  for (const base of BASES) {
+    const mid = await getMidKrwPerBase(base).catch(() => null); // KRW per BASE
+    for (const site of SITES) {
+      try {
+        let res;
+        if (site === "e9pay") res = await scrape_e9pay(page, base);
+        else if (site === "gmoneytrans") res = await scrape_gmoneytrans(page, base);
+        else res = await scrape_gme(page, base);
+
+        const { ok, val, why } = gateAgainstMid(res.value, mid);
+
+        rows.push({
+          timestamp: new Date().toISOString(),
+          site,
+          base,
+          quote: "KRW",
+          service_krw_per_base: ok ? val : null,
+          mid_krw_per_base: mid ?? null,
+          spread_krw_per_base: ok && mid ? (val - mid) : null,
+          spread_pct: ok && mid ? (val - mid) / mid : null,
+          ok,
+          error: ok ? `raw:${res.raw}` : `raw:${res.raw} | ${why || "parse failed"}`
+        });
+      } catch (e) {
+        rows.push({
+          timestamp: new Date().toISOString(),
+          site,
+          base,
+          quote: "KRW",
+          service_krw_per_base: null,
+          mid_krw_per_base: mid ?? null,
+          spread_krw_per_base: null,
+          spread_pct: null,
+          ok: false,
+          error: (e?.message || String(e)).slice(0, 240)
+        });
+      }
     }
   }
-  return out;
+
+  await browser.close();
+  return rows;
 }
-
-async function main() {
-  const sheets = await getSheetsClient();
-  for (const tab of TABS) await ensureHeader(sheets, tab);
-
-  const rows = await scrapeAll();
-  const grouped = groupRowsByBase(rows);
-
-  for (const base of Object.keys(grouped)) {
-    const tab = base; // tab names equal to base: VND/CNY/NPR/KHR
-    if (!TABS.includes(tab)) continue;
-
-    const g = grouped[base];
-    const { bestSite, bestRate } = pickBestSite(g);
-    const notes = g.notes.join(" | ");
-
-    const append = [
-      g.date,
-      g.time,
-      g.e9pay || 0,
-      g.gmoney || 0,
-      g.gme || 0,
-      g.mid ?? "",
-      bestSite,
-      bestRate || 0,
-      notes,
-    ];
-
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: `${tab}!A:A`,
-      valueInputOption: "USER_ENTERED",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values: [append] },
-    });
-  }
-}
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
