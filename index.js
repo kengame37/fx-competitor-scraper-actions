@@ -1,20 +1,14 @@
-// index.js — tabs per currency (VND/CNY/NPR/KHR), one row per run with all 3 sites
+// index.js
 import { google } from "googleapis";
 import { scrapeAll } from "./scrape.js";
 
-// ---- ENV ----
-const SPREADSHEET_ID = process.env.SHEET_ID; // Google Sheet ID
-const GOOGLE_CREDENTIALS = JSON.parse(process.env.GOOGLE_CREDENTIALS || "{}");
-const TIMEZONE = process.env.TIMEZONE || "Asia/Seoul"; // for date/time split
+const SHEET_ID = process.env.SHEET_ID;
+const CREDS = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 
-// Tabs are the BASE currencies
-const TAB_BY_BASE = {
-  VND: process.env.SHEET_VND || "VND",
-  CNY: process.env.SHEET_CNY || "CNY",
-  NPR: process.env.SHEET_NPR || "NPR",
-  KHR: process.env.SHEET_KHR || "KHR",
-};
+// Tabs (must exist in the spreadsheet)
+const TABS = ["VND", "CNY", "NPR", "KHR"];
 
+// Column header
 const HEADER = [
   "date",
   "time",
@@ -27,154 +21,105 @@ const HEADER = [
   "notes",
 ];
 
-function formatDate(d, tz) {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
-}
-function formatTime(d, tz) {
-  return new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(d);
-}
-
-function safeRateKRWPerBaseFromImplied(impliedBasePerKRW) {
-  // implied = BASE per 1 KRW; we want KRW per 1 BASE
-  if (impliedBasePerKRW == null) return null;
-  const r = 1 / impliedBasePerKRW;
-  return Number.isFinite(r) && r > 0 ? r : null;
-}
-
-async function getSheets() {
+async function getSheetsClient() {
   const auth = new google.auth.JWT(
-    GOOGLE_CREDENTIALS.client_email,
+    CREDS.client_email,
     null,
-    GOOGLE_CREDENTIALS.private_key,
+    CREDS.private_key.replace(/\\n/g, "\n"),
     ["https://www.googleapis.com/auth/spreadsheets"]
   );
-  await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
 
-async function listSheetTitles(sheets) {
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  return new Set((meta.data.sheets || []).map(s => s.properties?.title));
-}
-
-async function ensureSheetAndHeader(sheets, title) {
-  const titles = await listSheetTitles(sheets);
-  if (!titles.has(title)) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-    });
-  }
+async function ensureHeader(sheets, tab) {
+  const range = `${tab}!A1:I1`;
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${title}!A1:I1`,
+    spreadsheetId: SHEET_ID, range,
   }).catch(() => null);
-  const hasHeader = res?.data?.values?.length > 0;
-  if (!hasHeader) {
+
+  const have = res?.data?.values?.[0] || [];
+  const same = have.length === HEADER.length && have.every((v, i) => v === HEADER[i]);
+  if (!same) {
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${title}!A1`,
+      spreadsheetId: SHEET_ID,
+      range,
       valueInputOption: "RAW",
       requestBody: { values: [HEADER] },
     });
   }
 }
 
-async function appendRow(sheets, title, row) {
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${title}!A:A`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [row] },
-  });
+function pickBestSite(row) {
+  const candidates = [
+    { site: "e9pay", rate: row.e9pay || 0 },
+    { site: "gmoney", rate: row.gmoney || 0 },
+    { site: "gme", rate: row.gme || 0 },
+  ].filter(x => x.rate > 0);
+
+  if (!candidates.length) return { bestSite: "", bestRate: 0 };
+  const best = candidates.reduce((a, b) => (b.rate > a.rate ? b : a));
+  return { bestSite: best.site, bestRate: best.rate };
 }
 
-(async () => {
-  try {
-    const sheets = await getSheets();
-
-    // Ensure all currency tabs exist with headers
-    for (const tab of Object.values(TAB_BY_BASE)) {
-      await ensureSheetAndHeader(sheets, tab);
+function groupRowsByBase(rows) {
+  const out = {};
+  for (const r of rows) {
+    const base = r.base;
+    if (!out[base]) {
+      out[base] = {
+        date: r.date, time: r.time, mid: r.mid_krw_per_base ?? null,
+        e9pay: 0, gmoney: 0, gme: 0, notes: []
+      };
     }
-
-    // Scrape results (site × pair)
-    const results = await scrapeAll();
-
-    const now = new Date(results?.[0]?.ts || Date.now());
-    const dateStr = formatDate(now, TIMEZONE);
-    const timeStr = formatTime(now, TIMEZONE);
-
-    // Prepare per-currency records
-    const bases = ["VND", "CNY", "NPR", "KHR"];
-    const perBase = Object.fromEntries(
-      bases.map(b => [b, { e9pay: null, gmoneytrans: null, gme: null, mid: null, notes: [] }])
-    );
-
-    // Fill from raw rows
-    for (const r of results) {
-      const [base, quote] = (r.pair || "").split("/");
-      if (!bases.includes(base) || quote !== "KRW") continue;
-
-      // mid is KRW per BASE from API (same across sites). Keep first seen.
-      if (perBase[base].mid == null && r.mid_raw_from_api != null) {
-        perBase[base].mid = r.mid_raw_from_api;
-      }
-
-      // Only keep service rate if sanity check passed (ok === true)
-      if (r.ok === true) {
-        const rateKRWPerBase = safeRateKRWPerBaseFromImplied(r.implied_base_per_KRW);
-        if (rateKRWPerBase != null) {
-          if (r.site === "e9pay") perBase[base].e9pay = rateKRWPerBase;
-          else if (r.site === "gmoneytrans") perBase[base].gmoneytrans = rateKRWPerBase;
-          else if (r.site === "gme") perBase[base].gme = rateKRWPerBase;
-        } else if (r.error) {
-          perBase[base].notes.push(`${r.site}: ${r.error}`);
-        }
-      } else if (r.error) {
-        perBase[base].notes.push(`${r.site}: ${r.error}`);
-      }
+    if (r.ok && r.service_krw_per_base) {
+      if (r.site === "e9pay") out[base].e9pay = r.service_krw_per_base;
+      if (r.site === "gmoneytrans") out[base].gmoney = r.service_krw_per_base;
+      if (r.site === "gme") out[base].gme = r.service_krw_per_base;
+    } else if (r.error) {
+      out[base].notes.push(`${r.site}: ${r.error}`);
     }
-
-    // One row per currency tab
-    for (const base of bases) {
-      const tab = TAB_BY_BASE[base];
-      const entry = perBase[base];
-
-      // choose best among non-null
-      const cands = [
-        ["e9pay", entry.e9pay],
-        ["gmoney", entry.gmoneytrans],
-        ["gme", entry.gme],
-      ].filter(([_n, v]) => Number.isFinite(v));
-
-      let bestSite = "";
-      let bestRate = "";
-      if (cands.length) {
-        const [n, v] = cands.reduce((a, b) => (a[1] > b[1] ? a : b));
-        bestSite = n;
-        bestRate = v;
-      }
-
-      const row = [
-        dateStr,
-        timeStr,
-        entry.e9pay ?? "",        // blanks if missing, not 0
-        entry.gmoneytrans ?? "",
-        entry.gme ?? "",
-        entry.mid ?? "",
-        bestSite,
-        bestRate,
-        entry.notes.join(" | "),
-      ];
-
-      await appendRow(sheets, tab, row);
-    }
-
-    console.log("OK: appended rows to currency tabs.");
-  } catch (e) {
-    console.error("Run failed:", e?.message || e);
-    process.exit(1);
   }
-})();
+  return out;
+}
+
+async function main() {
+  const sheets = await getSheetsClient();
+  for (const tab of TABS) await ensureHeader(sheets, tab);
+
+  const rows = await scrapeAll();
+  const grouped = groupRowsByBase(rows);
+
+  for (const base of Object.keys(grouped)) {
+    const tab = base; // tab names equal to base: VND/CNY/NPR/KHR
+    if (!TABS.includes(tab)) continue;
+
+    const g = grouped[base];
+    const { bestSite, bestRate } = pickBestSite(g);
+    const notes = g.notes.join(" | ");
+
+    const append = [
+      g.date,
+      g.time,
+      g.e9pay || 0,
+      g.gmoney || 0,
+      g.gme || 0,
+      g.mid ?? "",
+      bestSite,
+      bestRate || 0,
+      notes,
+    ];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: `${tab}!A:A`,
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: { values: [append] },
+    });
+  }
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
