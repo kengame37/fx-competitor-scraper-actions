@@ -1,254 +1,232 @@
-import { chromium } from "playwright";
-import fs from "fs/promises";
+// scrape.js
+import { chromium, devices } from "playwright";
 
-const PAIRS = [
-  ["VND", "KRW"],
-  ["CNY", "KRW"],
-  ["NPR", "KRW"],
-  ["KHR", "KRW"],
+/** Pairs we care about (BASE/KRW) and the human country name to select per site */
+const CORRIDORS = [
+  { base: "CNY", country: "China" },
+  { base: "VND", country: "Vietnam" },
+  { base: "NPR", country: "Nepal" },
+  { base: "KHR", country: "Cambodia" },
 ];
-const SITES = ["gmoneytrans", "e9pay", "gme"];
 
-// For send-amount method (fill KRW and read BASE receive)
-const SEND_KRW_AMOUNT = 100000; // 100k won
+// Use a common amount so the widgets render a rate
+const SEND_KRW_AMOUNT = 1_000_000;
 
-// Currency code -> optional symbol/label hints
-const CODE_HINTS = {
-  KRW: ["KRW", "원", "₩"],
-  VND: ["VND", "₫"],
-  CNY: ["CNY", "¥", "RMB", "CNH"],
-  NPR: ["NPR", "रू", "Rs"],
-  KHR: ["KHR", "៛"],
-};
+// --- helpers ---------------------------------------------------------------
 
-// ---------- utilities ----------
+/** read numeric from "1 XXX = 194.96 KRW" or "1 KRW = 0.005119 XXX" */
+function extractKrwPerBaseFromText(txt, base) {
+  // remove commas & NBSPs
+  const t = (txt || "").replace(/\u00a0/g, " ").replace(/,/g, "").trim();
 
-async function fetchJSON(url) {
-  const r = await fetch(url, { cache: "no-store", headers: { "Accept": "application/json" } });
-  const t = await r.text();
-  try { return JSON.parse(t); } catch { throw new Error("mid payload not JSON"); }
+  // Case A: 1 BASE = N KRW   -> direct
+  let m = t.match(new RegExp(`1\\s*${base}\\s*=\\s*([0-9.]+)\\s*KRW`, "i"));
+  if (m) return parseFloat(m[1]);
+
+  // Case B: 1 KRW = N BASE   -> invert
+  m = t.match(new RegExp(`1\\s*KRW\\s*=\\s*([0-9.]+)\\s*${base}`, "i"));
+  if (m) return 1 / parseFloat(m[1]);
+
+  // plain number? return NaN if not found
+  const onlyNum = t.match(/([0-9]+(?:\.[0-9]+)?)/);
+  return onlyNum ? parseFloat(onlyNum[1]) : NaN;
 }
 
-async function getMid(base, quote) {
-  try {
-    const a = await fetchJSON(`https://api.exchangerate.host/latest?base=${base}&symbols=${quote}`);
-    if (a?.rates?.[quote] != null) return a.rates[quote]; // KRW per BASE
-    throw new Error("missing rates");
-  } catch (e1) {
-    const b = await fetchJSON(`https://open.er-api.com/v6/latest/${base}`);
-    if (b?.result === "success" && b?.rates?.[quote] != null) return b.rates[quote];
-    throw new Error(`mid fetch failed: ${e1.message}`);
-  }
-}
-
-function mostPlausibleNumberAroundBase(body, base, expectedBaseAmount) {
-  // Find numbers adjacent to base code/symbol: "123.45 VND", "VND 123.45", etc.
-  const hints = (CODE_HINTS[base] || [base]).concat(base);
-  const re = new RegExp(
-    `(?:${hints.join("|")})\\s*([\\d,\\.]+)|([\\d,\\.]+)\\s*(?:${hints.join("|")})`,
-    "gi"
-  );
-  let cand = [];
-  let m;
-  while ((m = re.exec(body)) !== null) {
-    const raw = (m[1] || m[2] || "").replace(/,/g, "");
-    const v = Number(raw);
-    if (Number.isFinite(v) && v > 0) cand.push(v);
-  }
-  if (!cand.length) return null;
-
-  // Choose the one closest to expectedBaseAmount
-  if (Number.isFinite(expectedBaseAmount) && expectedBaseAmount > 0) {
-    cand.sort((a, b) => Math.abs(a - expectedBaseAmount) - Math.abs(b - expectedBaseAmount));
-  } else {
-    cand.sort((a, b) => b - a); // fallback: pick largest
-  }
-  return cand[0] ?? null;
-}
-
-async function clickSome(page, labels) {
-  for (const t of labels) {
-    try {
-      const el = page.getByText(t, { exact:false }).first();
-      if (await el.count()) { await el.click({ timeout: 1200 }); await page.waitForTimeout(300); }
-    } catch {}
-  }
-}
-async function waitIdle(page) {
-  try { await page.waitForLoadState("networkidle", { timeout: 8000 }); } catch {}
-  await page.waitForTimeout(600);
-}
-
-async function saveDebug(page, name) {
-  try {
-    await fs.mkdir("debug", { recursive: true });
-    await page.screenshot({ path: `debug/${name}.png`, fullPage: true });
-    await fs.writeFile(`debug/${name}.html`, await page.content(), "utf8");
-  } catch {}
-}
-
-// sanity: implied_base_per_KRW must be within ±40% of mid_base_per_KRW
-function isSane(implied_base_per_KRW, mid_krw_per_base) {
-  if (!Number.isFinite(implied_base_per_KRW) || implied_base_per_KRW <= 0) return false;
-  if (!Number.isFinite(mid_krw_per_base) || mid_krw_per_base <= 0) return false;
-  const mid_base_per_krw = 1 / mid_krw_per_base;
-  return implied_base_per_KRW > mid_base_per_krw * 0.6 && implied_base_per_KRW < mid_base_per_krw * 1.4;
-}
-
-// ---------- scrapers per site ----------
-
-async function scrape_gme(page, base="USD", quote="KRW", mid_krw_per_base) {
-  await page.goto("https://www.gmeremit.com/personal/", { timeout: 60000 });
-  await clickSome(page, ["Accept", "Agree", "동의", "확인", "OK"]);
-  await waitIdle(page);
-
-  // Try "1 BASE = X KRW"
-  const html = await page.content();
-  const m = html.match(new RegExp(`1\\s*${base}\\s*=\\s*([\\d,\\.]+)\\s*${quote}`, "i"));
-  if (m && m[1]) {
-    const krw_per_base = Number(m[1].replace(/,/g, ""));
-    if (Number.isFinite(krw_per_base) && krw_per_base > 0) {
-      const implied = 1 / krw_per_base; // BASE per KRW
-      if (isSane(implied, mid_krw_per_base)) return { implied_base_per_KRW: implied, ok: true };
+/** convenience: click anything that looks like it */
+async function clickOneOf(page, selectors) {
+  for (const s of selectors) {
+    const loc = page.locator(s);
+    if (await loc.first().count()) {
+      try { await loc.first().click({ timeout: 1500 }); return true; } catch {}
     }
   }
-
-  await saveDebug(page, `gme-${base}`);
-  return { implied_base_per_KRW: null, ok: false, error: "no 1 BASE = KRW pattern" };
+  return false;
 }
 
-async function scrape_e9pay(page, base="USD", quote="KRW", mid_krw_per_base) {
-  await page.goto("https://www.e9pay.co.kr/", { timeout: 60000 });
-  await clickSome(page, ["동의","확인","허용","Accept","Agree"]);
-  await waitIdle(page);
-
-  // Try to find direct 1 BASE = KRW
-  let html = await page.content();
-  let m = html.match(new RegExp(`1\\s*${base}\\s*=\\s*([\\d,\\.]+)\\s*${quote}`, "i"));
-  if (m && m[1]) {
-    const krw_per_base = Number(m[1].replace(/,/g, ""));
-    if (Number.isFinite(krw_per_base) && krw_per_base > 0) {
-      const implied = 1 / krw_per_base;
-      if (isSane(implied, mid_krw_per_base)) return { implied_base_per_KRW: implied, ok: true };
+async function setSendAmountKRW(page) {
+  // Try common number boxes (each site uses different markup)
+  const candidates = [
+    'input[type="number"]',
+    'input[inputmode="numeric"]',
+    'input[mode="numeric"]',
+    'input[name*="amount" i]',
+    'input[name*="send" i]',
+  ];
+  for (const s of candidates) {
+    const loc = page.locator(s).first();
+    if (await loc.count()) {
+      await loc.fill(""); await loc.type(String(SEND_KRW_AMOUNT));
+      await page.waitForTimeout(300);
+      break;
     }
   }
-
-  // Fallback: type KRW and read BASE amount near BASE code
-  try {
-    const inputs = page.locator('input[type="number"], input[mode=numeric], input[inputmode=numeric]');
-    if (await inputs.count()) {
-      await inputs.first().click({ timeout: 1200 });
-      await page.keyboard.press("Control+A").catch(()=>{});
-      await page.keyboard.type(String(SEND_KRW_AMOUNT));
-      await waitIdle(page);
-    }
-  } catch {}
-
-  html = await page.innerText("body").catch(()=> "");
-  const expectedBaseAmount = SEND_KRW_AMOUNT / mid_krw_per_base;
-  const baseAmt = mostPlausibleNumberAroundBase(html, base, expectedBaseAmount);
-  if (Number.isFinite(baseAmt) && baseAmt > 0) {
-    const implied = baseAmt / SEND_KRW_AMOUNT; // BASE per KRW
-    if (isSane(implied, mid_krw_per_base)) return { implied_base_per_KRW: implied, ok: true };
-  }
-
-  await saveDebug(page, `e9pay-${base}`);
-  return { implied_base_per_KRW: null, ok: false, error: "no reliable amount found" };
 }
 
-async function scrape_gmoneytrans(page, base="USD", quote="KRW", mid_krw_per_base) {
-  await page.goto("https://gmoneytrans.com/", { timeout: 60000 });
-  await clickSome(page, ["Accept","Agree","동의","확인","OK"]);
-  await waitIdle(page);
-
-  // Try 1 BASE = KRW
-  let html = await page.content();
-  let m = html.match(new RegExp(`1\\s*${base}\\s*=\\s*([\\d,\\.]+)\\s*${quote}`, "i"));
-  if (m && m[1]) {
-    const krw_per_base = Number(m[1].replace(/,/g, ""));
-    if (Number.isFinite(krw_per_base) && krw_per_base > 0) {
-      const implied = 1 / krw_per_base;
-      if (isSane(implied, mid_krw_per_base)) return { implied_base_per_KRW: implied, ok: true };
-    }
-  }
-
-  // Fallback: type KRW and read BASE amount near symbol/code
-  try {
-    const inputs = page.locator('input[type="number"], input[mode=numeric], input[inputmode=numeric]');
-    if (await inputs.count()) {
-      await inputs.first().click({ timeout: 1200 });
-      await page.keyboard.press("Control+A").catch(()=>{});
-      await page.keyboard.type(String(SEND_KRW_AMOUNT));
-      await waitIdle(page);
-    }
-  } catch {}
-
-  html = await page.innerText("body").catch(()=> "");
-  const expectedBaseAmount = SEND_KRW_AMOUNT / mid_krw_per_base;
-  const baseAmt = mostPlausibleNumberAroundBase(html, base, expectedBaseAmount);
-  if (Number.isFinite(baseAmt) && baseAmt > 0) {
-    const implied = baseAmt / SEND_KRW_AMOUNT;
-    if (isSane(implied, mid_krw_per_base)) return { implied_base_per_KRW: implied, ok: true };
-  }
-
-  await saveDebug(page, `gmoney-${base}`);
-  return { implied_base_per_KRW: null, ok: false, error: "no reliable amount found" };
+function resultRow({ site, base, krwPerBase, mid, ok, note }) {
+  const now = new Date();
+  const date = now.toISOString().slice(0,10);
+  const time = now.toTimeString().slice(0,8);
+  return {
+    date,
+    time,
+    site,
+    base,
+    quote: "KRW",
+    service_krw_per_base: Number.isFinite(krwPerBase) ? krwPerBase : 0,
+    mid_krw_per_base: Number.isFinite(mid) ? mid : null,
+    spread_krw_per_base: Number.isFinite(krwPerBase) && Number.isFinite(mid) ? (krwPerBase - mid) : null,
+    spread_pct: Number.isFinite(krwPerBase) && Number.isFinite(mid) ? ((krwPerBase - mid) / mid) : null,
+    ok: !!ok,
+    error: ok ? "" : (note || "no implied rate found"),
+  };
 }
 
-// ---------- main driver used by index.js ----------
+/** public FX mid (KRW per BASE) – exchangerate.host */
+async function getMidKrwPerBase(base) {
+  // mid is KRW per BASE => ask base=BASE, symbols=KRW → return KRW/BASE
+  const url = `https://api.exchangerate.host/latest?base=${base}&symbols=KRW`;
+  const r = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
+  const j = await r.json().catch(() => null);
+  if (j && j.rates && j.rates.KRW) return j.rates.KRW;
+  throw new Error("mid fetch failed");
+}
+
+// --- site scrapers ---------------------------------------------------------
+
+/** e9pay: rate appears under #display-exrate (e.g., "1 CNY = 194.96 KRW") */
+async function scrape_e9pay(page, base, country) {
+  await page.goto("https://www.e9pay.co.kr/", { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // try to pick the country in the little flag picker under "Amount to be remitted"
+  // open the country list near that widget (click the small flag dropdown in the amount box)
+  await clickOneOf(page, [
+    // openers
+    'div:has-text("Amount to be remitted") button',
+    'div.inner .box .ico_arrow_img', // fallback
+    'div.inner .box [role="button"]'
+  ]);
+
+  // click one of these country names
+  await clickOneOf(page, [
+    `text=${country}`, // English
+    `text=${country.toUpperCase()}`,
+  ]);
+
+  await setSendAmountKRW(page);
+
+  // The exact rate node:
+  const ex = page.locator("#display-exrate").first();
+  await ex.waitFor({ timeout: 8000 });
+  const txt = await ex.innerText().catch(() => "");
+  const krwPerBase = extractKrwPerBaseFromText(txt, base);
+
+  if (!Number.isFinite(krwPerBase)) throw new Error(`e9pay: bad text "${txt}"`);
+
+  return { krwPerBase, note: "" };
+}
+
+/** Gmoneytrans: the page shows "1 KRW = 0.005119 CNY" inside #rate (invert it) */
+async function scrape_gmoneytrans(page, base, country) {
+  await page.goto("https://gmoneytrans.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // open Receiving Country picker and choose
+  await clickOneOf(page, [
+    'div:has-text("Receiving Country")',
+    'div:has-text("Select Country")',
+    '.box_group .box_title_group',
+  ]);
+  await clickOneOf(page, [
+    `text=${country}`,
+    `text=${country.toUpperCase()}`,
+  ]);
+
+  await setSendAmountKRW(page);
+
+  // exact node with the rate text
+  const rateNode = page.locator("#rate").first();
+  await rateNode.waitFor({ timeout: 8000 });
+  const txt = await rateNode.innerText().catch(() => "");
+  // Example: "1 KRW = 0.005119 CNY" → invert
+  const krwPerBase = extractKrwPerBaseFromText(txt, base);
+
+  if (!Number.isFinite(krwPerBase)) throw new Error(`gmoneytrans: bad text "${txt}"`);
+
+  return { krwPerBase, note: "" };
+}
+
+/** GME: span#currentRate shows TARGET per KRW → invert to KRW per BASE */
+async function scrape_gme(page, base, country) {
+  await page.goto("https://www.gmeremit.com/personal/", { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // open "Select Your Country" / recipient combobox and choose
+  await clickOneOf(page, [
+    'text=Select Your Country',
+    'text=Recipient',
+    'label:has-text("Select Your Country") + *',
+  ]);
+  await clickOneOf(page, [
+    `text=${country}`,
+    `text=${country.toUpperCase()}`,
+  ]);
+
+  await setSendAmountKRW(page);
+
+  // exact node: Real Time Exchange Rate
+  const node = page.locator("#currentRate").first();
+  await node.waitFor({ timeout: 8000 });
+  const raw = (await node.innerText().catch(() => "")).replace(/,/g, "").trim();
+  const targetPerKRW = parseFloat(raw); // e.g., CNY per KRW
+  if (!Number.isFinite(targetPerKRW) || targetPerKRW <= 0) {
+    throw new Error(`gme: bad currentRate "${raw}"`);
+  }
+  // Convert to KRW per BASE
+  const krwPerBase = 1 / targetPerKRW;
+  return { krwPerBase, note: "" };
+}
+
+// --- main orchestrator -----------------------------------------------------
 
 export async function scrapeAll() {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ locale: "en-US" });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const context = await browser.newContext({
+    ...devices["Desktop Chrome"],
+    locale: "en-US",
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+  });
 
-  const rows = [];
-  const ts = new Date().toISOString();
+  const page = await context.newPage();
 
-  for (const [base, quote] of PAIRS) {
-    const mid_krw_per_base = await getMid(base, quote);
+  const out = [];
+  for (const { base, country } of CORRIDORS) {
+    const mid = await getMidKrwPerBase(base).catch(() => null);
 
-    for (const site of SITES) {
+    for (const site of ["e9pay", "gmoneytrans", "gme"]) {
       try {
-        let res;
-        if (site === "gmoneytrans") res = await scrape_gmoneytrans(page, base, quote, mid_krw_per_base);
-        else if (site === "e9pay") res = await scrape_e9pay(page, base, quote, mid_krw_per_base);
-        else if (site === "gme") res = await scrape_gme(page, base, quote, mid_krw_per_base);
-
-        if (res?.ok) {
-          rows.push({
-            ts, site, pair: `${base}/${quote}`,
-            implied_base_per_KRW: res.implied_base_per_KRW,
-            mid_raw_from_api: mid_krw_per_base,
-            margin_abs_base_per_KRW: res.implied_base_per_KRW - (1 / mid_krw_per_base),
-            margin_pct: (res.implied_base_per_KRW / (1 / mid_krw_per_base)) - 1,
-            ok: true,
-            error: null
-          });
+        let krwPerBase, note = "";
+        if (site === "e9pay") {
+          ({ krwPerBase, note } = await scrape_e9pay(page, base, country));
+        } else if (site === "gmoneytrans") {
+          ({ krwPerBase, note } = await scrape_gmoneytrans(page, base, country));
         } else {
-          rows.push({
-            ts, site, pair: `${base}/${quote}`,
-            implied_base_per_KRW: null,
-            mid_raw_from_api: mid_krw_per_base,
-            margin_abs_base_per_KRW: null,
-            margin_pct: null,
-            ok: false,
-            error: res?.error || "unknown scrape failure"
-          });
+          ({ krwPerBase, note } = await scrape_gme(page, base, country));
         }
+        out.push(resultRow({ site, base, krwPerBase, mid, ok: true, note }));
       } catch (e) {
-        rows.push({
-          ts, site, pair: `${base}/${quote}`,
-          implied_base_per_KRW: null,
-          mid_raw_from_api: mid_krw_per_base,
-          margin_abs_base_per_KRW: null, margin_pct: null,
+        out.push(resultRow({
+          site,
+          base,
+          krwPerBase: NaN,
+          mid,
           ok: false,
-          error: (e?.message || String(e)).slice(0, 200)
-        });
-        await saveDebug(page, `${site}-${base}-exception`);
+          note: (e?.message || String(e)).slice(0, 240)
+        }));
       }
     }
   }
 
   await browser.close();
-  return rows;
+  return out;
 }
