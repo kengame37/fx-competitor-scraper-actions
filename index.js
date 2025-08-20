@@ -15,18 +15,31 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 function nowKST() {
-  const d = new Date();
   const tz = "Asia/Seoul";
-  const date = new Intl.DateTimeFormat("en-CA", { timeZone: tz, dateStyle: "medium" })
-    .format(d)
-    .replace(/\./g, "-")
-    .replace(/\s/g, "")
-    .replace(/,$/, ""); // keep it clean
-  const time = new Intl.DateTimeFormat("en-GB", { timeZone: tz, timeStyle: "medium" }).format(d);
-  // standardize date to YYYY-MM-DD
-  const iso = new Date(d.toLocaleString("en-CA", { timeZone: tz })).toISOString().slice(0, 10);
-  return { date: iso, time };
+  const d = new Date();
+
+  // Build YYYY-MM-DD
+  const dParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const date = `${dParts.find(p => p.type === "year").value}-${dParts.find(p => p.type === "month").value}-${dParts.find(p => p.type === "day").value}`;
+
+  // Build HH:mm:ss (24h)
+  const tParts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const time = `${tParts.find(p => p.type === "hour").value}:${tParts.find(p => p.type === "minute").value}:${tParts.find(p => p.type === "second").value}`;
+
+  return { date, time };
 }
+
 
 async function appendRow(tab, row) {
   await sheets.spreadsheets.values.append({
